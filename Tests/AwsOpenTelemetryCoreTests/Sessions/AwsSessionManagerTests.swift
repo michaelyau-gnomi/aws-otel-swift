@@ -1,4 +1,6 @@
 import XCTest
+import OpenTelemetryApi
+import OpenTelemetrySdk
 @testable import AwsOpenTelemetryCore
 
 final class AwsSessionManagerTests: XCTestCase {
@@ -330,5 +332,125 @@ final class AwsSessionManagerTests: XCTestCase {
     }
 
     XCTAssertNotNil(sessionManager.peekSession())
+  }
+
+  func testUserDefaultsObserverCanReadSessionWhileSaving() {
+    // UserDefaults KVO runs synchronously on the saving thread, so this observer runs
+    // in the middle of the first save
+    let observer = UserDefaultsKeyObserver {
+      _ = self.sessionManager.peekSession()
+      _ = self.sessionManager.getSession()
+    }
+    UserDefaults.standard.addObserver(observer, forKeyPath: AwsSessionStore.idKey, options: [.new], context: nil)
+    defer { UserDefaults.standard.removeObserver(observer, forKeyPath: AwsSessionStore.idKey) }
+
+    let returned = expectation(description: "getSession returns")
+    DispatchQueue.global().async {
+      self.sessionManager.getSession()
+      returned.fulfill()
+    }
+
+    wait(for: [returned], timeout: 5.0)
+    XCTAssertGreaterThan(observer.callCount, 0)
+  }
+
+  func testSessionStartNotificationsArriveInStartOrder() {
+    AwsSessionEventInstrumentation.queue = []
+    AwsSessionEventInstrumentation.isApplied = true
+    sessionManager = AwsSessionManager(configuration: AwsSessionConfig(sessionTimeout: 1))
+
+    // Stall the first session's start event, before its notification is posted
+    let firstEventStarted = DispatchSemaphore(value: 0)
+    let releaseFirstEvent = DispatchSemaphore(value: 0)
+    let gate = GatedLogRecordProcessor {
+      firstEventStarted.signal()
+      releaseFirstEvent.wait()
+    }
+    OpenTelemetry.registerLoggerProvider(loggerProvider: LoggerProviderBuilder().with(processors: [gate]).build())
+    defer {
+      OpenTelemetry.registerLoggerProvider(loggerProvider: DefaultLoggerProvider.instance)
+      AwsSessionEventInstrumentation.isApplied = false
+    }
+
+    let lock = NSLock()
+    var notifiedIds: [String] = []
+    let notified = expectation(description: "Both session start notifications")
+    notified.expectedFulfillmentCount = 2
+    let observer = NotificationCenter.default.addObserver(forName: SessionStartNotification, object: nil, queue: nil) { notification in
+      if let session = notification.object as? AwsSession {
+        lock.withLock { notifiedIds.append(session.id) }
+      }
+      notified.fulfill()
+    }
+    defer { NotificationCenter.default.removeObserver(observer) }
+
+    DispatchQueue.global().async {
+      self.sessionManager.getSession()
+    }
+    firstEventStarted.wait()
+
+    // Let the first session expire while its events are stalled, then start the next one
+    Thread.sleep(forTimeInterval: 1.2)
+    let secondSession = sessionManager.getSession()
+    releaseFirstEvent.signal()
+
+    wait(for: [notified], timeout: 5.0)
+    let ids = lock.withLock { notifiedIds }
+    XCTAssertEqual(ids.count, 2)
+    XCTAssertEqual(ids.first, secondSession.previousId)
+    // Observers such as KSCrash keep the last session they were told about
+    XCTAssertEqual(ids.last, secondSession.id)
+  }
+}
+
+/// Calls `onChange` whenever the observed UserDefaults key changes
+private final class UserDefaultsKeyObserver: NSObject {
+  private let onChange: () -> Void
+  private let lock = NSLock()
+  private var _callCount = 0
+
+  var callCount: Int {
+    return lock.withLock { _callCount }
+  }
+
+  init(onChange: @escaping () -> Void) {
+    self.onChange = onChange
+  }
+
+  override func observeValue(forKeyPath keyPath: String?,
+                             of object: Any?,
+                             change: [NSKeyValueChangeKey: Any]?,
+                             context: UnsafeMutableRawPointer?) {
+    lock.withLock { _callCount += 1 }
+    onChange()
+  }
+}
+
+/// Runs `onFirstEmit` on the first log record it receives, and ignores the rest
+private final class GatedLogRecordProcessor: LogRecordProcessor {
+  private let onFirstEmit: () -> Void
+  private let lock = NSLock()
+  private var hasEmitted = false
+
+  init(onFirstEmit: @escaping () -> Void) {
+    self.onFirstEmit = onFirstEmit
+  }
+
+  func onEmit(logRecord: ReadableLogRecord) {
+    let isFirst: Bool = lock.withLock {
+      defer { hasEmitted = true }
+      return !hasEmitted
+    }
+    if isFirst {
+      onFirstEmit()
+    }
+  }
+
+  func shutdown(explicitTimeout: TimeInterval?) -> ExportResult {
+    return .success
+  }
+
+  func forceFlush(explicitTimeout: TimeInterval?) -> ExportResult {
+    return .success
   }
 }

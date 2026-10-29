@@ -21,14 +21,20 @@ import Foundation
 public class AwsSessionManager {
   private var configuration: AwsSessionConfig
 
-  /// Guards `_session` and `_isSessionSampled`, so checking for an expired session and
-  /// replacing it happen as one step even when spans start on several threads at once.
-  /// Session events and the start notification are sent after it is released, because
-  /// they can call back into this manager (a `session.start` log record passes through
-  /// `AwsSessionLogProcessor`, which calls `getSession()`).
+  /// Guards the state below, so checking for an expired session and replacing it happen
+  /// as one step even when spans start on several threads at once. Saving to disk, session
+  /// events and the start notification all happen after it is released, because they can
+  /// call back into this manager: a `session.start` log record passes through
+  /// `AwsSessionLogProcessor`, which calls `getSession()`, and UserDefaults observers run
+  /// synchronously.
   private let lock = NSLock()
   private var _session: AwsSession?
   private var _isSessionSampled: Bool = true
+  /// Started sessions waiting to be published, oldest first
+  private var pendingPublications: [SessionRefresh] = []
+  /// Whether a thread is publishing `pendingPublications`. Only one publishes at a time, so
+  /// observers see sessions in the order they started and the last one they see is current.
+  private var isPublishing = false
 
   /// Initializes the session manager and restores any previous session from disk
   /// - Parameter configuration: Session configuration settings
@@ -42,9 +48,22 @@ public class AwsSessionManager {
   /// - Returns: The current active session
   @discardableResult
   public func getSession() -> AwsSession {
-    let refresh = lock.withLock { refreshSession() }
-    if refresh.isNew {
-      publishSessionStart(refresh.session, previousSession: refresh.previousSession)
+    let (refresh, shouldPublish): (SessionRefresh, Bool) = lock.withLock {
+      let refresh = refreshSession()
+      if refresh.isNew {
+        pendingPublications.append(refresh)
+      }
+      // If another thread is publishing, it publishes this session after its own
+      guard !isPublishing, !pendingPublications.isEmpty else {
+        return (refresh, false)
+      }
+      isPublishing = true
+      return (refresh, true)
+    }
+
+    AwsSessionStore.scheduleSave(session: refresh.session, sequence: refresh.saveSequence)
+    if shouldPublish {
+      publishPendingSessions()
     }
     return refresh.session
   }
@@ -72,6 +91,8 @@ public class AwsSessionManager {
     let session: AwsSession
     let isNew: Bool
     let previousSession: AwsSession?
+    /// Keeps saves in the order the session changed, though they run after `lock` is released
+    let saveSequence: UInt64
   }
 
   /// Creates a new session with a unique identifier. Must be called with `lock` held.
@@ -100,7 +121,12 @@ public class AwsSessionManager {
       sessionTimeout: configuration.sessionTimeout
     )
     _session = session
-    return SessionRefresh(session: session, isNew: true, previousSession: previousSession)
+    return SessionRefresh(
+      session: session,
+      isNew: true,
+      previousSession: previousSession,
+      saveSequence: AwsSessionStore.nextSaveSequence()
+    )
   }
 
   /// Refreshes the current session, creating new one if expired or extending existing one.
@@ -117,14 +143,35 @@ public class AwsSessionManager {
         sessionTimeout: configuration.sessionTimeout
       )
       _session = extended
-      refresh = SessionRefresh(session: extended, isNew: false, previousSession: nil)
+      refresh = SessionRefresh(
+        session: extended,
+        isNew: false,
+        previousSession: nil,
+        saveSequence: AwsSessionStore.nextSaveSequence()
+      )
     } else {
       refresh = startSession()
     }
-    // Saved under the lock so the store always holds the latest expireTime.
-    // AwsSessionStore never calls back into this manager.
-    AwsSessionStore.scheduleSave(session: refresh.session)
     return refresh
+  }
+
+  /// Publishes started sessions in the order they started, until none are left.
+  /// Must be called without `lock` held, by the thread that set `isPublishing`.
+  private func publishPendingSessions() {
+    while let next = takeNextPublication() {
+      publishSessionStart(next.session, previousSession: next.previousSession)
+    }
+  }
+
+  /// Takes the oldest unpublished session, or ends this thread's turn as publisher if none
+  private func takeNextPublication() -> SessionRefresh? {
+    return lock.withLock {
+      guard !pendingPublications.isEmpty else {
+        isPublishing = false
+        return nil
+      }
+      return pendingPublications.removeFirst()
+    }
   }
 
   /// Sends the `session.end` and `session.start` events and the start notification.

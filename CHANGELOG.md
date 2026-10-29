@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 ## Unreleased
 
 ### Fixed
-- Make session tracking thread-safe. `AwsSessionManager` now checks for, starts and extends a session in one locked step; `AwsSessionEventInstrumentation` locks its event queue and `isApplied` flag; and `AwsSessionStore` locks its state and saves on a dispatch timer, which also fires when the first save happens off the main thread. Fixes a crash in `AwsSessionEventInstrumentation.addSession` when several URLSession requests start while the SDK is initializing. Session events and the session start notification are still sent outside the locks, because they can call back into the session manager.
+- Make session tracking thread-safe. `AwsSessionManager` now checks for, starts and extends a session in one locked step; `AwsSessionEventInstrumentation` locks its event queue and `isApplied` flag; and `AwsSessionStore` locks its state and saves on a dispatch timer, which also fires when the first save happens off the main thread. Fixes a crash in `AwsSessionEventInstrumentation.addSession` when several URLSession requests start while the SDK is initializing. UserDefaults writes, session events and the session start notification all happen outside the locks, because they can call back into the session manager. Saves keep the order the session changed in, and session starts are published in the order they happened, so observers such as KSCrash end on the current session.
 
 ## v1.1.0 - 2026-08-19
 

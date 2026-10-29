@@ -32,8 +32,10 @@ class AwsSessionStore {
   // To avoid writing to disk too often, SessionStore only keeps the current session
   // in memory and saves to disk on an interval (every 30 seconds).
 
-  /// Guards `pendingSession`, `prevSession` and `saveTimer`. Saves are scheduled from
-  /// whichever thread refreshes the session, while the timer fires on `saveQueue`.
+  /// Guards the static state below. Saves are scheduled from whichever thread refreshes
+  /// the session, while the timer fires on `saveQueue`. It is never held while writing to
+  /// UserDefaults: defaults observers run synchronously and may call back into the session
+  /// manager, which can be in the middle of scheduling a save.
   private static let lock = NSLock()
   /// The most recent session to be saved to disk
   private static var pendingSession: AwsSession?
@@ -46,42 +48,119 @@ class AwsSessionStore {
   private static var saveTimer: DispatchSourceTimer?
   /// The queue the save timer fires on
   private static let saveQueue = DispatchQueue(label: "software.amazon.opentelemetry.SessionStore", qos: .utility)
+  /// The last sequence number handed out by `nextSaveSequence()`
+  private static var lastIssuedSequence: UInt64 = 0
+  /// The highest sequence number accepted by `scheduleSave`, so a save that arrives late
+  /// can't replace a newer session
+  private static var lastScheduledSequence: UInt64 = 0
+  /// The next session to write, picked up by whichever thread is currently writing
+  private static var sessionToWrite: AwsSession?
+  /// Whether a thread is writing to UserDefaults. Only one writes at a time, so the keys of
+  /// two sessions never interleave and the last requested session is the one left on disk.
+  private static var isWriting = false
+
+  /// Returns an increasing sequence number to pass to `scheduleSave(session:sequence:)`.
+  /// Take it while the session is changed, so saves keep that order even if they run later.
+  static func nextSaveSequence() -> UInt64 {
+    return lock.withLock {
+      lastIssuedSequence += 1
+      return lastIssuedSequence
+    }
+  }
 
   /// Schedules a session to be saved to UserDefaults on the next timer interval
-  /// - Parameter session: The session to save
-  static func scheduleSave(session: AwsSession) {
-    lock.withLock {
+  /// - Parameters:
+  ///   - session: The session to save
+  ///   - sequence: From `nextSaveSequence()`. A save with a lower number than one already
+  ///     scheduled is ignored. Pass nil to schedule unconditionally.
+  static func scheduleSave(session: AwsSession, sequence: UInt64? = nil) {
+    let saveNow: Bool = lock.withLock {
+      if let sequence {
+        guard sequence > lastScheduledSequence else {
+          return false
+        }
+        lastScheduledSequence = sequence
+      }
       pendingSession = session
 
-      if saveTimer == nil {
-        // save initial session
-        save(session: session)
-
-        // save future sessions on a interval
-        let timer = DispatchSource.makeTimerSource(queue: saveQueue)
-        timer.schedule(deadline: .now() + saveInterval, repeating: saveInterval)
-        timer.setEventHandler {
-          lock.withLock {
-            // only write to disk if it is a new sesssion
-            if let pending = pendingSession, prevSession != pending {
-              save(session: pending)
-            }
-          }
-        }
-        timer.resume()
-        saveTimer = timer
+      guard saveTimer == nil else {
+        return false
       }
+
+      // save future sessions on a interval
+      let timer = DispatchSource.makeTimerSource(queue: saveQueue)
+      timer.schedule(deadline: .now() + saveInterval, repeating: saveInterval)
+      timer.setEventHandler {
+        // only write to disk if it is a new sesssion
+        let pending: AwsSession? = lock.withLock {
+          guard let pending = pendingSession, prevSession != pending else {
+            return nil
+          }
+          return pending
+        }
+        if let pending {
+          save(session: pending)
+        }
+      }
+      timer.resume()
+      saveTimer = timer
+      return true
+    }
+
+    // save initial session
+    if saveNow {
+      save(session: session)
     }
   }
 
   /// Immediately saves a session to UserDefaults
   /// - Parameter session: The session to save
   static func saveImmediately(session: AwsSession) {
-    lock.withLock { save(session: session) }
+    save(session: session)
   }
 
-  /// Saves a session to UserDefaults. Must be called with `lock` held.
+  /// Writes a session to UserDefaults without holding `lock`. If another thread is already
+  /// writing, it writes this session once it finishes, and this call returns straight away.
   private static func save(session: AwsSession) {
+    let isWriter: Bool = lock.withLock {
+      sessionToWrite = session
+      guard !isWriting else {
+        return false
+      }
+      isWriting = true
+      return true
+    }
+    guard isWriter else {
+      return
+    }
+
+    while let next = takeSessionToWrite() {
+      write(session: next)
+      lock.withLock {
+        // update prev session
+        prevSession = next
+        // clear pending session, since it is now outdated, unless a newer one arrived
+        if pendingSession == next {
+          pendingSession = nil
+        }
+      }
+    }
+  }
+
+  /// Takes the next session to write, or ends this thread's turn as writer if there is none
+  private static func takeSessionToWrite() -> AwsSession? {
+    return lock.withLock {
+      guard let next = sessionToWrite else {
+        isWriting = false
+        return nil
+      }
+      sessionToWrite = nil
+      return next
+    }
+  }
+
+  /// Persists a session to UserDefaults. Must be called without `lock` held.
+  private static func write(session: AwsSession) {
     AwsInternalLogger.debug("Saving session to UserDefaults: \(session.id)")
 
     // Persist session
@@ -90,11 +169,6 @@ class AwsSessionStore {
     UserDefaults.standard.set(session.startTime, forKey: startTimeKey)
     UserDefaults.standard.set(session.previousId, forKey: previousIdKey)
     UserDefaults.standard.set(session.sessionTimeout, forKey: sessionTimeoutKey)
-
-    // update prev session
-    prevSession = session
-    // clear pending session, since it is now outdated
-    pendingSession = nil
   }
 
   /// Loads a previously saved session from UserDefaults
@@ -134,12 +208,14 @@ class AwsSessionStore {
       saveTimer = nil
       pendingSession = nil
       prevSession = nil
-      UserDefaults.standard.removeObject(forKey: idKey)
-      UserDefaults.standard.removeObject(forKey: startTimeKey)
-      UserDefaults.standard.removeObject(forKey: expireTimeKey)
-      UserDefaults.standard.removeObject(forKey: previousIdKey)
-      UserDefaults.standard.removeObject(forKey: sessionTimeoutKey)
+      sessionToWrite = nil
+      lastScheduledSequence = 0
     }
+    UserDefaults.standard.removeObject(forKey: idKey)
+    UserDefaults.standard.removeObject(forKey: startTimeKey)
+    UserDefaults.standard.removeObject(forKey: expireTimeKey)
+    UserDefaults.standard.removeObject(forKey: previousIdKey)
+    UserDefaults.standard.removeObject(forKey: sessionTimeoutKey)
     AwsInternalLogger.debug("AwsSessionStore teardown complete")
   }
 }
