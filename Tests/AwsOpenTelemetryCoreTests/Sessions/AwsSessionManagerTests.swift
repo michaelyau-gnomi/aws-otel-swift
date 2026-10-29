@@ -357,17 +357,22 @@ final class AwsSessionManagerTests: XCTestCase {
   func testSessionStartNotificationsArriveInStartOrder() {
     AwsSessionEventInstrumentation.queue = []
     AwsSessionEventInstrumentation.isApplied = true
-    sessionManager = AwsSessionManager(configuration: AwsSessionConfig(sessionTimeout: 1))
+    // Expire immediately so this test never blocks the main run loop to advance time.
+    // Blocking it would trigger hang instrumentation left running by earlier suites.
+    let manager = AwsSessionManager(configuration: AwsSessionConfig(sessionTimeout: 0))
+    sessionManager = manager
 
     // Stall the first session's start event, before its notification is posted
-    let firstEventStarted = DispatchSemaphore(value: 0)
+    let firstEventStarted = expectation(description: "First session start event")
+    let firstCallReturned = expectation(description: "First getSession returns")
     let releaseFirstEvent = DispatchSemaphore(value: 0)
     let gate = GatedLogRecordProcessor {
-      firstEventStarted.signal()
+      firstEventStarted.fulfill()
       releaseFirstEvent.wait()
     }
     OpenTelemetry.registerLoggerProvider(loggerProvider: LoggerProviderBuilder().with(processors: [gate]).build())
     defer {
+      releaseFirstEvent.signal()
       OpenTelemetry.registerLoggerProvider(loggerProvider: DefaultLoggerProvider.instance)
       AwsSessionEventInstrumentation.isApplied = false
     }
@@ -385,16 +390,18 @@ final class AwsSessionManagerTests: XCTestCase {
     defer { NotificationCenter.default.removeObserver(observer) }
 
     DispatchQueue.global().async {
-      self.sessionManager.getSession()
+      manager.getSession()
+      firstCallReturned.fulfill()
     }
-    firstEventStarted.wait()
+    let firstEventResult = XCTWaiter.wait(for: [firstEventStarted], timeout: 5.0)
+    XCTAssertEqual(firstEventResult, .completed)
+    guard firstEventResult == .completed else { return }
 
-    // Let the first session expire while its events are stalled, then start the next one
-    Thread.sleep(forTimeInterval: 1.2)
-    let secondSession = sessionManager.getSession()
+    // The first session is already expired, but its publication is still stalled.
+    let secondSession = manager.getSession()
     releaseFirstEvent.signal()
 
-    wait(for: [notified], timeout: 5.0)
+    wait(for: [notified, firstCallReturned], timeout: 5.0)
     let ids = lock.withLock { notifiedIds }
     XCTAssertEqual(ids.count, 2)
     XCTAssertEqual(ids.first, secondSession.previousId)
