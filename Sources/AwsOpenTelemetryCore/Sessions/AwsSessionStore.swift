@@ -70,6 +70,9 @@ class AwsSessionStore {
   /// Whether a thread is writing to UserDefaults. Only one writes at a time, so the keys of
   /// two sessions never interleave and the last requested session is the one left on disk.
   private static var isWriting = false
+  /// The sequence number of the write in progress, if it has one. It is neither queued nor
+  /// written yet, so it has to be checked separately.
+  private static var writingSequence: UInt64?
 
   /// Returns an increasing sequence number to pass to `scheduleSave(session:sequence:)`.
   /// Take it while the session is changed, so saves keep that order even if they run later.
@@ -134,8 +137,8 @@ class AwsSessionStore {
 
   /// Writes a session to UserDefaults without holding `lock`. If another thread is already
   /// writing, it writes this session once it finishes, and this call returns straight away.
-  /// A sequenced write older than one already written or queued is dropped; an unsequenced
-  /// write is always made.
+  /// A sequenced write older than one already written, in progress or queued is dropped;
+  /// an unsequenced write is always made.
   static func save(session: AwsSession, sequence: UInt64?) {
     save(PendingWrite(session: session, sequence: sequence))
   }
@@ -143,10 +146,8 @@ class AwsSessionStore {
   private static func save(_ request: PendingWrite) {
     let isWriter: Bool = lock.withLock {
       if let sequence = request.sequence {
-        guard sequence > lastWrittenSequence else {
-          return false
-        }
-        if let queued = nextWrite?.sequence, sequence < queued {
+        let newest = max(lastWrittenSequence, writingSequence ?? 0, nextWrite?.sequence ?? 0)
+        guard sequence > newest else {
           return false
         }
       }
@@ -180,15 +181,19 @@ class AwsSessionStore {
     }
   }
 
-  /// Takes the next write, or ends this thread's turn as writer if there is none
+  /// Takes the next write, or ends this thread's turn as writer if there is none. A queued
+  /// write is checked again here, in case a newer one was written after it was queued.
   private static func takeNextWrite() -> PendingWrite? {
     return lock.withLock {
-      guard let next = nextWrite else {
-        isWriting = false
-        return nil
-      }
+      let next = nextWrite
       nextWrite = nil
-      return next
+      if let next, next.sequence.map({ $0 > lastWrittenSequence }) ?? true {
+        writingSequence = next.sequence
+        return next
+      }
+      isWriting = false
+      writingSequence = nil
+      return nil
     }
   }
 
@@ -244,6 +249,7 @@ class AwsSessionStore {
       pendingSequence = nil
       prevSession = nil
       nextWrite = nil
+      writingSequence = nil
       lastScheduledSequence = 0
       lastWrittenSequence = 0
     }

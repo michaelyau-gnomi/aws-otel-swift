@@ -163,6 +163,30 @@ final class AwsSessionStoreTests: XCTestCase {
     XCTAssertEqual(UserDefaults.standard.string(forKey: AwsSessionStore.idKey), newer.id)
   }
 
+  func testStaleSaveSubmittedDuringNewerWriteIsDropped() {
+    let older = AwsSession(id: "older-session", expireTime: Date(timeIntervalSinceNow: 1800), previousId: nil, startTime: Date(), sessionTimeout: 1800)
+    let newer = AwsSession(id: "newer-session", expireTime: Date(timeIntervalSinceNow: 1800), previousId: "older-session", startTime: Date(), sessionTimeout: 1800)
+    let olderSequence = AwsSessionStore.nextSaveSequence()
+    let newerSequence = AwsSessionStore.nextSaveSequence()
+
+    // UserDefaults KVO runs synchronously inside the write, so the older save arrives
+    // while the newer one is still being written
+    var submitted = false
+    let observer = StoreKeyObserver {
+      guard !submitted else { return }
+      submitted = true
+      AwsSessionStore.save(session: older, sequence: olderSequence)
+    }
+    UserDefaults.standard.addObserver(observer, forKeyPath: AwsSessionStore.idKey, options: [.new], context: nil)
+    defer { UserDefaults.standard.removeObserver(observer, forKeyPath: AwsSessionStore.idKey) }
+
+    AwsSessionStore.save(session: newer, sequence: newerSequence)
+
+    XCTAssertTrue(submitted)
+    XCTAssertEqual(UserDefaults.standard.string(forKey: AwsSessionStore.idKey), newer.id)
+    XCTAssertEqual(UserDefaults.standard.string(forKey: AwsSessionStore.previousIdKey), newer.previousId)
+  }
+
   func testUnsequencedSaveIsAlwaysWritten() {
     let sequenced = AwsSession(id: "sequenced-session", expireTime: Date(timeIntervalSinceNow: 1800), previousId: nil, startTime: Date(), sessionTimeout: 1800)
     let explicit = AwsSession(id: "explicit-session", expireTime: Date(timeIntervalSinceNow: 1800), previousId: nil, startTime: Date(), sessionTimeout: 1800)
@@ -180,5 +204,21 @@ final class AwsSessionStoreTests: XCTestCase {
 
     let loadedSession = AwsSessionStore.load()
     XCTAssertNil(loadedSession, "Session should be nil when timeout is missing")
+  }
+}
+
+/// Calls `onChange` whenever the observed UserDefaults key changes
+private final class StoreKeyObserver: NSObject {
+  private let onChange: () -> Void
+
+  init(onChange: @escaping () -> Void) {
+    self.onChange = onChange
+  }
+
+  override func observeValue(forKeyPath keyPath: String?,
+                             of object: Any?,
+                             change: [NSKeyValueChangeKey: Any]?,
+                             context: UnsafeMutableRawPointer?) {
+    onChange()
   }
 }
