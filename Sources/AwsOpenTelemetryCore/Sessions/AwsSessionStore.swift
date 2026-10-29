@@ -39,6 +39,8 @@ class AwsSessionStore {
   private static let lock = NSLock()
   /// The most recent session to be saved to disk
   private static var pendingSession: AwsSession?
+  /// The sequence number `pendingSession` was scheduled with, if any
+  private static var pendingSequence: UInt64?
   /// The previous session
   private static var prevSession: AwsSession?
   /// The interval period after which the current session is saved to disk
@@ -53,8 +55,18 @@ class AwsSessionStore {
   /// The highest sequence number accepted by `scheduleSave`, so a save that arrives late
   /// can't replace a newer session
   private static var lastScheduledSequence: UInt64 = 0
+  /// The highest sequence number written to UserDefaults. A write with a lower number is
+  /// dropped, so a save that stalls before writing can't replace a newer session on disk.
+  private static var lastWrittenSequence: UInt64 = 0
+
+  /// A session waiting to be written, with the sequence number it was scheduled with
+  private struct PendingWrite {
+    let session: AwsSession
+    let sequence: UInt64?
+  }
+
   /// The next session to write, picked up by whichever thread is currently writing
-  private static var sessionToWrite: AwsSession?
+  private static var nextWrite: PendingWrite?
   /// Whether a thread is writing to UserDefaults. Only one writes at a time, so the keys of
   /// two sessions never interleave and the last requested session is the one left on disk.
   private static var isWriting = false
@@ -82,6 +94,7 @@ class AwsSessionStore {
         lastScheduledSequence = sequence
       }
       pendingSession = session
+      pendingSequence = sequence
 
       guard saveTimer == nil else {
         return false
@@ -92,14 +105,14 @@ class AwsSessionStore {
       timer.schedule(deadline: .now() + saveInterval, repeating: saveInterval)
       timer.setEventHandler {
         // only write to disk if it is a new sesssion
-        let pending: AwsSession? = lock.withLock {
+        let pending: PendingWrite? = lock.withLock {
           guard let pending = pendingSession, prevSession != pending else {
             return nil
           }
-          return pending
+          return PendingWrite(session: pending, sequence: pendingSequence)
         }
         if let pending {
-          save(session: pending)
+          save(pending)
         }
       }
       timer.resume()
@@ -109,21 +122,35 @@ class AwsSessionStore {
 
     // save initial session
     if saveNow {
-      save(session: session)
+      save(PendingWrite(session: session, sequence: sequence))
     }
   }
 
   /// Immediately saves a session to UserDefaults
   /// - Parameter session: The session to save
   static func saveImmediately(session: AwsSession) {
-    save(session: session)
+    save(PendingWrite(session: session, sequence: nil))
   }
 
   /// Writes a session to UserDefaults without holding `lock`. If another thread is already
   /// writing, it writes this session once it finishes, and this call returns straight away.
-  private static func save(session: AwsSession) {
+  /// A sequenced write older than one already written or queued is dropped; an unsequenced
+  /// write is always made.
+  static func save(session: AwsSession, sequence: UInt64?) {
+    save(PendingWrite(session: session, sequence: sequence))
+  }
+
+  private static func save(_ request: PendingWrite) {
     let isWriter: Bool = lock.withLock {
-      sessionToWrite = session
+      if let sequence = request.sequence {
+        guard sequence > lastWrittenSequence else {
+          return false
+        }
+        if let queued = nextWrite?.sequence, sequence < queued {
+          return false
+        }
+      }
+      nextWrite = request
       guard !isWriting else {
         return false
       }
@@ -134,27 +161,33 @@ class AwsSessionStore {
       return
     }
 
-    while let next = takeSessionToWrite() {
-      write(session: next)
+    // Only this thread writes until `takeNextWrite()` ends its turn, so nothing newer can
+    // reach the disk between taking a write and making it
+    while let next = takeNextWrite() {
+      write(session: next.session)
       lock.withLock {
+        if let sequence = next.sequence {
+          lastWrittenSequence = max(lastWrittenSequence, sequence)
+        }
         // update prev session
-        prevSession = next
+        prevSession = next.session
         // clear pending session, since it is now outdated, unless a newer one arrived
-        if pendingSession == next {
+        if pendingSession == next.session {
           pendingSession = nil
+          pendingSequence = nil
         }
       }
     }
   }
 
-  /// Takes the next session to write, or ends this thread's turn as writer if there is none
-  private static func takeSessionToWrite() -> AwsSession? {
+  /// Takes the next write, or ends this thread's turn as writer if there is none
+  private static func takeNextWrite() -> PendingWrite? {
     return lock.withLock {
-      guard let next = sessionToWrite else {
+      guard let next = nextWrite else {
         isWriting = false
         return nil
       }
-      sessionToWrite = nil
+      nextWrite = nil
       return next
     }
   }
@@ -189,6 +222,7 @@ class AwsSessionStore {
 
       // reset sessions so it does not get overridden in the next scheduled save
       pendingSession = nil
+      pendingSequence = nil
       prevSession = AwsSession(
         id: id,
         expireTime: expireTime,
@@ -207,9 +241,11 @@ class AwsSessionStore {
       saveTimer?.cancel()
       saveTimer = nil
       pendingSession = nil
+      pendingSequence = nil
       prevSession = nil
-      sessionToWrite = nil
+      nextWrite = nil
       lastScheduledSequence = 0
+      lastWrittenSequence = 0
     }
     UserDefaults.standard.removeObject(forKey: idKey)
     UserDefaults.standard.removeObject(forKey: startTimeKey)

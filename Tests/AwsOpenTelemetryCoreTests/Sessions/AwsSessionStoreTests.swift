@@ -136,6 +136,43 @@ final class AwsSessionStoreTests: XCTestCase {
     XCTAssertEqual(savedId, session2.id)
   }
 
+  func testStaleSequencedSaveDoesNotReplaceNewerSession() {
+    let older = AwsSession(id: "older-session", expireTime: Date(timeIntervalSinceNow: 1800), previousId: nil, startTime: Date(), sessionTimeout: 1800)
+    let newer = AwsSession(id: "newer-session", expireTime: Date(timeIntervalSinceNow: 1800), previousId: "older-session", startTime: Date(), sessionTimeout: 1800)
+    let olderSequence = AwsSessionStore.nextSaveSequence()
+    let newerSequence = AwsSessionStore.nextSaveSequence()
+
+    // The newer session reaches the disk first, as when the timer writes it while the
+    // older session's initial save is stalled before writing
+    AwsSessionStore.save(session: newer, sequence: newerSequence)
+    AwsSessionStore.save(session: older, sequence: olderSequence)
+
+    XCTAssertEqual(UserDefaults.standard.string(forKey: AwsSessionStore.idKey), newer.id)
+    XCTAssertEqual(AwsSessionStore.load()?.id, newer.id)
+  }
+
+  func testStaleScheduledSaveIsIgnored() {
+    let older = AwsSession(id: "older-session", expireTime: Date(timeIntervalSinceNow: 1800), previousId: nil, startTime: Date(), sessionTimeout: 1800)
+    let newer = AwsSession(id: "newer-session", expireTime: Date(timeIntervalSinceNow: 1800), previousId: "older-session", startTime: Date(), sessionTimeout: 1800)
+    let olderSequence = AwsSessionStore.nextSaveSequence()
+    let newerSequence = AwsSessionStore.nextSaveSequence()
+
+    AwsSessionStore.scheduleSave(session: newer, sequence: newerSequence)
+    AwsSessionStore.scheduleSave(session: older, sequence: olderSequence)
+
+    XCTAssertEqual(UserDefaults.standard.string(forKey: AwsSessionStore.idKey), newer.id)
+  }
+
+  func testUnsequencedSaveIsAlwaysWritten() {
+    let sequenced = AwsSession(id: "sequenced-session", expireTime: Date(timeIntervalSinceNow: 1800), previousId: nil, startTime: Date(), sessionTimeout: 1800)
+    let explicit = AwsSession(id: "explicit-session", expireTime: Date(timeIntervalSinceNow: 1800), previousId: nil, startTime: Date(), sessionTimeout: 1800)
+
+    AwsSessionStore.save(session: sequenced, sequence: AwsSessionStore.nextSaveSequence())
+    AwsSessionStore.saveImmediately(session: explicit)
+
+    XCTAssertEqual(UserDefaults.standard.string(forKey: AwsSessionStore.idKey), explicit.id)
+  }
+
   func testLoadSessionMissingTimeout() {
     UserDefaults.standard.set("test-id", forKey: AwsSessionStore.idKey)
     UserDefaults.standard.set(Date(), forKey: AwsSessionStore.expireTimeKey)
