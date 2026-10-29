@@ -272,4 +272,63 @@ final class AwsSessionManagerTests: XCTestCase {
     sessionManager.getSession()
     XCTAssertFalse(sessionManager.isSessionSampled)
   }
+
+  // MARK: - Concurrency
+
+  func testConcurrentGetSessionStartsOneSession() {
+    AwsSessionEventInstrumentation.queue = []
+    AwsSessionEventInstrumentation.isApplied = false
+    defer { AwsSessionEventInstrumentation.queue = [] }
+
+    let lock = NSLock()
+    var ids = Set<String>()
+    DispatchQueue.concurrentPerform(iterations: 500) { _ in
+      let id = sessionManager.getSession().id
+      lock.withLock { _ = ids.insert(id) }
+    }
+
+    XCTAssertEqual(ids.count, 1)
+    XCTAssertEqual(AwsSessionEventInstrumentation.queue.count, 1)
+    XCTAssertEqual(AwsSessionEventInstrumentation.queue.first?.session.id, ids.first)
+    XCTAssertEqual(AwsSessionEventInstrumentation.queue.first?.eventType, .start)
+  }
+
+  func testConcurrentGetSessionWithExpiringSessionsKeepsOneChain() {
+    AwsSessionEventInstrumentation.queue = []
+    AwsSessionEventInstrumentation.isApplied = false
+    defer { AwsSessionEventInstrumentation.queue = [] }
+    sessionManager = AwsSessionManager(configuration: AwsSessionConfig(sessionTimeout: 0))
+
+    // Every call starts a new session, so every call races to replace the previous one
+    let iterations = 200
+    let lock = NSLock()
+    var sessions: [AwsSession] = []
+    DispatchQueue.concurrentPerform(iterations: iterations) { _ in
+      let session = sessionManager.getSession()
+      lock.withLock { sessions.append(session) }
+    }
+
+    // Each session replaced exactly one other, so the sessions form a single chain
+    XCTAssertEqual(Set(sessions.map(\.id)).count, iterations)
+    XCTAssertEqual(sessions.filter { $0.previousId == nil }.count, 1)
+    let previousIds = sessions.compactMap(\.previousId)
+    XCTAssertEqual(Set(previousIds).count, iterations - 1)
+    XCTAssertTrue(Set(previousIds).isSubset(of: Set(sessions.map(\.id))))
+
+    // Queued events are capped rather than corrupted
+    XCTAssertEqual(AwsSessionEventInstrumentation.queue.count, Int(AwsSessionEventInstrumentation.maxQueueSize))
+  }
+
+  func testConcurrentGetAndPeekSession() {
+    DispatchQueue.concurrentPerform(iterations: 500) { i in
+      if i.isMultiple(of: 2) {
+        sessionManager.getSession()
+      } else {
+        _ = sessionManager.peekSession()
+        _ = sessionManager.isSessionSampled
+      }
+    }
+
+    XCTAssertNotNil(sessionManager.peekSession())
+  }
 }

@@ -457,4 +457,32 @@ final class AwsSessionEventInstrumentationTests: XCTestCase {
     XCTAssertEqual(AwsSessionEventInstrumentation.queue[0].eventType, .start)
     XCTAssertEqual(AwsSessionEventInstrumentation.queue[1].eventType, .end)
   }
+
+  // MARK: - Concurrency
+
+  func testConcurrentAddSessionBeforeInstall() {
+    DispatchQueue.concurrentPerform(iterations: 500) { i in
+      let session = AwsSession(id: "session-\(i)", expireTime: Date().addingTimeInterval(3600))
+      AwsSessionEventInstrumentation.addSession(session: session, eventType: .start)
+    }
+
+    XCTAssertEqual(AwsSessionEventInstrumentation.queue.count, Int(AwsSessionEventInstrumentation.maxQueueSize))
+  }
+
+  func testConcurrentAddSessionDuringInstallLeavesNothingQueued() {
+    // The in-memory exporter isn't thread-safe, so emit into the no-op provider here
+    OpenTelemetry.registerLoggerProvider(loggerProvider: DefaultLoggerProvider.instance)
+
+    DispatchQueue.concurrentPerform(iterations: 500) { i in
+      if i == 10 {
+        AwsSessionEventInstrumentation.install()
+      }
+      let session = AwsSession(id: "session-\(i)", expireTime: Date().addingTimeInterval(3600))
+      AwsSessionEventInstrumentation.addSession(session: session, eventType: .start)
+    }
+
+    // An event queued after the queue was drained would never be emitted
+    XCTAssertTrue(AwsSessionEventInstrumentation.isApplied)
+    XCTAssertEqual(AwsSessionEventInstrumentation.queue.count, 0)
+  }
 }

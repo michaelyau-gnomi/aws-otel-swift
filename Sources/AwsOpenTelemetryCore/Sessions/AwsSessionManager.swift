@@ -20,18 +20,14 @@ import Foundation
 /// Sessions are automatically extended on access and persisted to UserDefaults.
 public class AwsSessionManager {
   private var configuration: AwsSessionConfig
+
+  /// Guards `_session` and `_isSessionSampled`, so checking for an expired session and
+  /// replacing it happen as one step even when spans start on several threads at once.
+  /// Session events and the start notification are sent after it is released, because
+  /// they can call back into this manager (a `session.start` log record passes through
+  /// `AwsSessionLogProcessor`, which calls `getSession()`).
+  private let lock = NSLock()
   private var _session: AwsSession?
-
-  private var session: AwsSession? {
-    get {
-      return sessionQueue.sync { _session }
-    }
-    set {
-      sessionQueue.sync { _session = newValue }
-    }
-  }
-
-  private let sessionQueue = DispatchQueue(label: "software.amazon.opentelemetry.SessionManager", qos: .utility)
   private var _isSessionSampled: Bool = true
 
   /// Initializes the session manager and restores any previous session from disk
@@ -46,19 +42,22 @@ public class AwsSessionManager {
   /// - Returns: The current active session
   @discardableResult
   public func getSession() -> AwsSession {
-    refreshSession()
-    return session!
+    let refresh = lock.withLock { refreshSession() }
+    if refresh.isNew {
+      publishSessionStart(refresh.session, previousSession: refresh.previousSession)
+    }
+    return refresh.session
   }
 
   /// Gets the current session without extending its expireTime time
   /// - Returns: The current session if one exists, nil otherwise
   public func peekSession() -> AwsSession? {
-    return session
+    return lock.withLock { _session }
   }
 
   /// Gets whether the current session is sampled
   public var isSessionSampled: Bool {
-    return _isSessionSampled
+    return lock.withLock { _isSessionSampled }
   }
 
   /// Determines if a session should be sampled based on the sample rate
@@ -68,10 +67,18 @@ public class AwsSessionManager {
     return Double.random(in: 0.01 ... 1) <= sampleRate
   }
 
-  /// Creates a new session with a unique identifier
-  private func startSession() {
+  /// The outcome of a refresh, carried out of the lock so its side effects can run unlocked
+  private struct SessionRefresh {
+    let session: AwsSession
+    let isNew: Bool
+    let previousSession: AwsSession?
+  }
+
+  /// Creates a new session with a unique identifier. Must be called with `lock` held.
+  private func startSession() -> SessionRefresh {
     let now = Date()
-    let previousId = session?.id
+    let previousSession = _session
+    let previousId = previousSession?.id
     let newId = UUID().uuidString
 
     // Update session sampling based on RNG
@@ -85,56 +92,59 @@ public class AwsSessionManager {
       AwsInternalLogger.debug("Session \(newId) will be sampled")
     }
 
-    // Store previous session for cleanup outside the lock
-    let previousSession = session
-
-    // Create new session
-    session = AwsSession(
+    let session = AwsSession(
       id: newId,
       expireTime: now.addingTimeInterval(Double(configuration.sessionTimeout)),
       previousId: previousId,
       startTime: now,
       sessionTimeout: configuration.sessionTimeout
     )
+    _session = session
+    return SessionRefresh(session: session, isNew: true, previousSession: previousSession)
+  }
 
+  /// Refreshes the current session, creating new one if expired or extending existing one.
+  /// Must be called with `lock` held.
+  private func refreshSession() -> SessionRefresh {
+    let refresh: SessionRefresh
+    if let current = _session, !current.isExpired() {
+      // Otherwise, extend the existing session but preserve the startTime
+      let extended = AwsSession(
+        id: current.id,
+        expireTime: Date(timeIntervalSinceNow: Double(configuration.sessionTimeout)),
+        previousId: current.previousId,
+        startTime: current.startTime,
+        sessionTimeout: configuration.sessionTimeout
+      )
+      _session = extended
+      refresh = SessionRefresh(session: extended, isNew: false, previousSession: nil)
+    } else {
+      refresh = startSession()
+    }
+    // Saved under the lock so the store always holds the latest expireTime.
+    // AwsSessionStore never calls back into this manager.
+    AwsSessionStore.scheduleSave(session: refresh.session)
+    return refresh
+  }
+
+  /// Sends the `session.end` and `session.start` events and the start notification.
+  /// Must be called without `lock` held.
+  private func publishSessionStart(_ session: AwsSession, previousSession: AwsSession?) {
     // Queue the previous session for a `session.end` event
     if let previousSession {
       AwsSessionEventInstrumentation.addSession(session: previousSession, eventType: .end)
     }
 
     // Queue the new session for a `session.start`` event
-    AwsSessionEventInstrumentation.addSession(session: session!, eventType: .start)
+    AwsSessionEventInstrumentation.addSession(session: session, eventType: .start)
 
     // Post notification for session start
-    NotificationCenter.default.post(name: SessionStartNotification, object: session!)
-  }
-
-  /// Refreshes the current session, creating new one if expired or extending existing one
-  private func refreshSession() {
-    if session == nil || session!.isExpired() {
-      startSession()
-    } else {
-      // Otherwise, extend the existing session but preserve the startTime
-      session = AwsSession(
-        id: session!.id,
-        expireTime: Date(timeIntervalSinceNow: Double(configuration.sessionTimeout)),
-        previousId: session!.previousId,
-        startTime: session!.startTime,
-        sessionTimeout: configuration.sessionTimeout
-      )
-    }
-    saveSessionToDisk()
-  }
-
-  /// Schedules the current session to be persisted to UserDefaults
-  private func saveSessionToDisk() {
-    if session != nil {
-      AwsSessionStore.scheduleSave(session: session!)
-    }
+    NotificationCenter.default.post(name: SessionStartNotification, object: session)
   }
 
   /// Restores a previously saved session from UserDefaults
   private func restoreSessionFromDisk() {
-    session = AwsSessionStore.load()
+    let restored = AwsSessionStore.load()
+    lock.withLock { _session = restored }
   }
 }
