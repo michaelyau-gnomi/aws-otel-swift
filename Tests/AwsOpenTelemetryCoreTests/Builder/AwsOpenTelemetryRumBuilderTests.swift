@@ -15,12 +15,22 @@ final class AwsOpenTelemetryRumBuilderTests: XCTestCase {
 
   // Reset the shared instance state between tests
   override func tearDown() {
+    resetTelemetry()
+    super.tearDown()
+  }
+
+  private func resetTelemetry() {
+    // Instrumentation retains its tracer even after the global provider is replaced.
+    // Shut it down so late hang reports and URLSession retries cannot refresh sessions
+    // belonging to this test during a later test's setup or assertions.
+    (OpenTelemetry.instance.tracerProvider as? TracerProviderSdk)?.shutdown()
+    OpenTelemetry.registerTracerProvider(tracerProvider: DefaultTracerProvider.instance)
+    OpenTelemetry.registerLoggerProvider(loggerProvider: DefaultLoggerProvider.instance)
     AwsOpenTelemetryAgent.shared.isInitialized = false
     AwsOpenTelemetryAgent.shared.configuration = nil
     #if canImport(UIKit) && !os(watchOS)
       AwsOpenTelemetryAgent.shared.uiKitViewInstrumentation = nil
     #endif
-    super.tearDown()
   }
 
   func testBasicBuilderCreationAndBuild() {
@@ -184,6 +194,26 @@ final class AwsOpenTelemetryRumBuilderTests: XCTestCase {
     XCTAssertTrue(AwsOpenTelemetryAgent.shared.isInitialized)
   }
 
+  func testResetTelemetryStopsRetainedTracersFromSavingSessions() {
+    let config = AwsOpenTelemetryConfig(aws: AwsConfig(region: region, rumAppMonitorId: appMonitorId))
+    guard let builder = AwsOpenTelemetryRumBuilder.create(config: config) else {
+      XCTFail("Failed to create builder")
+      return
+    }
+    builder.build()
+    // Network and hang instrumentation can retain this tracer past test cleanup.
+    let retainedTracer = OpenTelemetry.instance.tracerProvider.get(instrumentationName: "retained-instrumentation")
+
+    resetTelemetry()
+    AwsSessionStore.teardown()
+    defer { AwsSessionStore.teardown() }
+
+    let span = retainedTracer.spanBuilder(spanName: "late-request").startSpan()
+    span.end()
+
+    XCTAssertNil(UserDefaults.standard.string(forKey: AwsSessionStore.idKey))
+  }
+
   #if canImport(UIKit) && !os(watchOS)
     func testUIKitInstrumentationConfiguration() {
       // Test UIKit instrumentation enabled/disabled/default scenarios
@@ -207,8 +237,7 @@ final class AwsOpenTelemetryRumBuilderTests: XCTestCase {
       XCTAssertNotNil(AwsOpenTelemetryAgent.shared.uiKitViewInstrumentation, "Should create UIKit instrumentation when enabled")
 
       // Reset for next test
-      AwsOpenTelemetryAgent.shared.isInitialized = false
-      AwsOpenTelemetryAgent.shared.uiKitViewInstrumentation = nil
+      resetTelemetry()
 
       // Test disabled
       let disabledTelemetryConfig = AwsTelemetryConfig()
@@ -227,8 +256,7 @@ final class AwsOpenTelemetryRumBuilderTests: XCTestCase {
       XCTAssertNil(AwsOpenTelemetryAgent.shared.uiKitViewInstrumentation, "Should not create UIKit instrumentation when disabled")
 
       // Reset for next test
-      AwsOpenTelemetryAgent.shared.isInitialized = false
-      AwsOpenTelemetryAgent.shared.uiKitViewInstrumentation = nil
+      resetTelemetry()
 
       // Test default (should be enabled)
       let defaultConfig = AwsOpenTelemetryConfig(
@@ -286,6 +314,7 @@ final class AwsOpenTelemetryRumBuilderTests: XCTestCase {
     let mockExporter = StdoutSpanExporter()
     let resource = Resource()
     let provider = builder.buildTracerProvider(spanExporter: mockExporter, resource: resource)
+    defer { (provider as? TracerProviderSdk)?.shutdown() }
 
     XCTAssertNotNil(provider)
   }

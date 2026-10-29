@@ -1,4 +1,6 @@
 import XCTest
+import OpenTelemetryApi
+import OpenTelemetrySdk
 @testable import AwsOpenTelemetryCore
 
 final class AwsSessionManagerTests: XCTestCase {
@@ -271,5 +273,191 @@ final class AwsSessionManagerTests: XCTestCase {
     sessionManager = AwsSessionManager(configuration: AwsSessionConfig(sessionSampleRate: 0.0))
     sessionManager.getSession()
     XCTAssertFalse(sessionManager.isSessionSampled)
+  }
+
+  // MARK: - Concurrency
+
+  func testConcurrentGetSessionStartsOneSession() {
+    AwsSessionEventInstrumentation.queue = []
+    AwsSessionEventInstrumentation.isApplied = false
+    defer { AwsSessionEventInstrumentation.queue = [] }
+
+    let lock = NSLock()
+    var ids = Set<String>()
+    DispatchQueue.concurrentPerform(iterations: 500) { _ in
+      let id = sessionManager.getSession().id
+      lock.withLock { _ = ids.insert(id) }
+    }
+
+    XCTAssertEqual(ids.count, 1)
+    XCTAssertEqual(AwsSessionEventInstrumentation.queue.count, 1)
+    XCTAssertEqual(AwsSessionEventInstrumentation.queue.first?.session.id, ids.first)
+    XCTAssertEqual(AwsSessionEventInstrumentation.queue.first?.eventType, .start)
+  }
+
+  func testConcurrentGetSessionWithExpiringSessionsKeepsOneChain() {
+    AwsSessionEventInstrumentation.queue = []
+    AwsSessionEventInstrumentation.isApplied = false
+    defer { AwsSessionEventInstrumentation.queue = [] }
+    sessionManager = AwsSessionManager(configuration: AwsSessionConfig(sessionTimeout: 0))
+
+    // Every call starts a new session, so every call races to replace the previous one
+    let iterations = 200
+    let lock = NSLock()
+    var sessions: [AwsSession] = []
+    DispatchQueue.concurrentPerform(iterations: iterations) { _ in
+      let session = sessionManager.getSession()
+      lock.withLock { sessions.append(session) }
+    }
+
+    // Each session replaced exactly one other, so the sessions form a single chain
+    XCTAssertEqual(Set(sessions.map(\.id)).count, iterations)
+    XCTAssertEqual(sessions.filter { $0.previousId == nil }.count, 1)
+    let previousIds = sessions.compactMap(\.previousId)
+    XCTAssertEqual(Set(previousIds).count, iterations - 1)
+    XCTAssertTrue(Set(previousIds).isSubset(of: Set(sessions.map(\.id))))
+
+    // Queued events are capped rather than corrupted
+    XCTAssertEqual(AwsSessionEventInstrumentation.queue.count, Int(AwsSessionEventInstrumentation.maxQueueSize))
+  }
+
+  func testConcurrentGetAndPeekSession() {
+    DispatchQueue.concurrentPerform(iterations: 500) { i in
+      if i.isMultiple(of: 2) {
+        sessionManager.getSession()
+      } else {
+        _ = sessionManager.peekSession()
+        _ = sessionManager.isSessionSampled
+      }
+    }
+
+    XCTAssertNotNil(sessionManager.peekSession())
+  }
+
+  func testUserDefaultsObserverCanReadSessionWhileSaving() {
+    // UserDefaults KVO runs synchronously on the saving thread, so this observer runs
+    // in the middle of the first save
+    let observer = UserDefaultsKeyObserver {
+      _ = self.sessionManager.peekSession()
+      _ = self.sessionManager.getSession()
+    }
+    UserDefaults.standard.addObserver(observer, forKeyPath: AwsSessionStore.idKey, options: [.new], context: nil)
+    defer { UserDefaults.standard.removeObserver(observer, forKeyPath: AwsSessionStore.idKey) }
+
+    let returned = expectation(description: "getSession returns")
+    DispatchQueue.global().async {
+      self.sessionManager.getSession()
+      returned.fulfill()
+    }
+
+    wait(for: [returned], timeout: 5.0)
+    XCTAssertGreaterThan(observer.callCount, 0)
+  }
+
+  func testSessionStartNotificationsArriveInStartOrder() {
+    AwsSessionEventInstrumentation.queue = []
+    AwsSessionEventInstrumentation.isApplied = true
+    // Expire immediately so this test never blocks the main run loop to advance time.
+    // Blocking it would trigger hang instrumentation left running by earlier suites.
+    let manager = AwsSessionManager(configuration: AwsSessionConfig(sessionTimeout: 0))
+    sessionManager = manager
+
+    // Stall the first session's start event, before its notification is posted
+    let firstEventStarted = expectation(description: "First session start event")
+    let firstCallReturned = expectation(description: "First getSession returns")
+    let releaseFirstEvent = DispatchSemaphore(value: 0)
+    let gate = GatedLogRecordProcessor {
+      firstEventStarted.fulfill()
+      releaseFirstEvent.wait()
+    }
+    OpenTelemetry.registerLoggerProvider(loggerProvider: LoggerProviderBuilder().with(processors: [gate]).build())
+    defer {
+      releaseFirstEvent.signal()
+      OpenTelemetry.registerLoggerProvider(loggerProvider: DefaultLoggerProvider.instance)
+      AwsSessionEventInstrumentation.isApplied = false
+    }
+
+    let lock = NSLock()
+    var notifiedIds: [String] = []
+    let notified = expectation(description: "Both session start notifications")
+    notified.expectedFulfillmentCount = 2
+    let observer = NotificationCenter.default.addObserver(forName: SessionStartNotification, object: nil, queue: nil) { notification in
+      if let session = notification.object as? AwsSession {
+        lock.withLock { notifiedIds.append(session.id) }
+      }
+      notified.fulfill()
+    }
+    defer { NotificationCenter.default.removeObserver(observer) }
+
+    DispatchQueue.global().async {
+      manager.getSession()
+      firstCallReturned.fulfill()
+    }
+    let firstEventResult = XCTWaiter.wait(for: [firstEventStarted], timeout: 5.0)
+    XCTAssertEqual(firstEventResult, .completed)
+    guard firstEventResult == .completed else { return }
+
+    // The first session is already expired, but its publication is still stalled.
+    let secondSession = manager.getSession()
+    releaseFirstEvent.signal()
+
+    wait(for: [notified, firstCallReturned], timeout: 5.0)
+    let ids = lock.withLock { notifiedIds }
+    XCTAssertEqual(ids.count, 2)
+    XCTAssertEqual(ids.first, secondSession.previousId)
+    // Observers such as KSCrash keep the last session they were told about
+    XCTAssertEqual(ids.last, secondSession.id)
+  }
+}
+
+/// Calls `onChange` whenever the observed UserDefaults key changes
+private final class UserDefaultsKeyObserver: NSObject {
+  private let onChange: () -> Void
+  private let lock = NSLock()
+  private var _callCount = 0
+
+  var callCount: Int {
+    return lock.withLock { _callCount }
+  }
+
+  init(onChange: @escaping () -> Void) {
+    self.onChange = onChange
+  }
+
+  override func observeValue(forKeyPath keyPath: String?,
+                             of object: Any?,
+                             change: [NSKeyValueChangeKey: Any]?,
+                             context: UnsafeMutableRawPointer?) {
+    lock.withLock { _callCount += 1 }
+    onChange()
+  }
+}
+
+/// Runs `onFirstEmit` on the first log record it receives, and ignores the rest
+private final class GatedLogRecordProcessor: LogRecordProcessor {
+  private let onFirstEmit: () -> Void
+  private let lock = NSLock()
+  private var hasEmitted = false
+
+  init(onFirstEmit: @escaping () -> Void) {
+    self.onFirstEmit = onFirstEmit
+  }
+
+  func onEmit(logRecord: ReadableLogRecord) {
+    let isFirst: Bool = lock.withLock {
+      defer { hasEmitted = true }
+      return !hasEmitted
+    }
+    if isFirst {
+      onFirstEmit()
+    }
+  }
+
+  func shutdown(explicitTimeout: TimeInterval?) -> ExportResult {
+    return .success
+  }
+
+  func forceFlush(explicitTimeout: TimeInterval?) -> ExportResult {
+    return .success
   }
 }

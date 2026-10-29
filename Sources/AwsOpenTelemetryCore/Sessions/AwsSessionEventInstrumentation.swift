@@ -44,11 +44,22 @@ public class AwsSessionEventInstrumentation {
     return OpenTelemetry.instance.loggerProvider.get(instrumentationScopeName: AwsSessionEventInstrumentation.instrumentationKey)
   }
 
+  /// Guards `_queue` and `_isApplied`. Sessions start on whichever thread first starts a
+  /// span, so `addSession` and `install` can run concurrently. Log records are emitted
+  /// after it is released, because emitting passes through processors that call back into
+  /// the session manager.
+  private static let lock = NSLock()
+  private static var _queue: [AwsSessionEvent] = []
+  private static var _isApplied = false
+
   /// Queue for storing session events that were created before instrumentation was initialized.
   /// This allows capturing session events that occur during application startup before
   /// the OpenTelemetry SDK is fully initialized.
   /// Limited to 20 items to prevent memory issues.
-  static var queue: [AwsSessionEvent] = []
+  static var queue: [AwsSessionEvent] {
+    get { lock.withLock { _queue } }
+    set { lock.withLock { _queue = newValue } }
+  }
 
   /// Maximum number of sessions that can be queued before instrumentation is applied
   static let maxQueueSize: UInt8 = 32
@@ -59,24 +70,37 @@ public class AwsSessionEventInstrumentation {
 
   /// Flag to track if the instrumentation has been applied.
   /// Controls whether new sessions are queued or immediately processed via notifications.
-  static var isApplied = false
+  static var isApplied: Bool {
+    get { lock.withLock { _isApplied } }
+    set { lock.withLock { _isApplied = newValue } }
+  }
+
   static func install() {
-    guard !isApplied else {
-      return
+    // Flip the flag and take the queue in one step, so no event lands in the queue
+    // after it has been drained
+    let queuedEvents: [AwsSessionEvent]? = lock.withLock {
+      guard !_isApplied else {
+        return nil
+      }
+
+      _isApplied = true
+      let events = _queue
+      _queue.removeAll()
+      return events
     }
 
-    isApplied = true
     // Process any queued sessions
-    processQueuedSessions()
+    if let queuedEvents {
+      processQueuedSessions(queuedEvents)
+    }
   }
 
   /// Process any sessions that were queued before instrumentation was applied.
   ///
   /// This method is called during the `apply()` process to handle any sessions that
   /// were created before the instrumentation was initialized. It creates log records
-  /// for all queued sessions and then clears the queue.
-  private static func processQueuedSessions() {
-    let sessionEvents = AwsSessionEventInstrumentation.queue
+  /// for the queued sessions, which `install()` has already removed from the queue.
+  private static func processQueuedSessions(_ sessionEvents: [AwsSessionEvent]) {
     AwsInternalLogger.debug("Processing \(sessionEvents.count) queued session events")
 
     if sessionEvents.isEmpty {
@@ -86,8 +110,6 @@ public class AwsSessionEventInstrumentation {
     for sessionEvent in sessionEvents {
       createSessionEvent(session: sessionEvent.session, eventType: sessionEvent.eventType)
     }
-
-    AwsSessionEventInstrumentation.queue.removeAll()
   }
 
   /// Create session start or end log record based on the specified event type.
@@ -163,16 +185,25 @@ public class AwsSessionEventInstrumentation {
   ///
   /// - Parameter session: The session to process
   static func addSession(session: AwsSession, eventType: SessionEventType) {
-    if isApplied {
-      createSessionEvent(session: session, eventType: eventType)
-    } else {
+    // Check the flag and queue the event in one step, so `install()` can't drain the
+    // queue between the two
+    let shouldEmit: Bool = lock.withLock {
+      if _isApplied {
+        return true
+      }
+
       // SessionManager creates sessions before SessionEventInstrumentation is applied,
       // which the notification observer cannot see. So we need to keep the sessions in a queue.
-      if queue.count >= maxQueueSize {
+      if _queue.count >= maxQueueSize {
         AwsInternalLogger.debug("Queue at max capacity (\(maxQueueSize)), dropping latest session event: \(session.id)")
-        return
+        return false
       }
-      queue.append(AwsSessionEvent(session: session, eventType: eventType))
+      _queue.append(AwsSessionEvent(session: session, eventType: eventType))
+      return false
+    }
+
+    if shouldEmit {
+      createSessionEvent(session: session, eventType: eventType)
     }
   }
 }
